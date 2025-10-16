@@ -1,46 +1,55 @@
 #!/bin/bash
 
 ################################################################################
+# LVM Root Filesystem Expansion Script
+#
 # Copyright (c) 2025 Darren Soothill
 # All rights reserved.
 #
-# This script is provided as-is without any warranty.
-################################################################################
-
-################################################################################
-# LVM Root Filesystem Expansion Script
-#
 # DESCRIPTION:
-#   This script automates the expansion of an LVM-based root filesystem to
-#   utilize all available disk space. It is particularly useful after expanding
-#   a virtual disk in VMware, VirtualBox, cloud platforms (AWS, Azure, GCP),
-#   or other virtualization environments.
+#   This script automatically expands the root filesystem on Ubuntu systems
+#   using LVM (Logical Volume Manager) to utilize all available physical disk
+#   space. It is particularly useful after expanding a virtual disk in
+#   hypervisors (VMware, VirtualBox, KVM, etc.) or cloud environments (AWS,
+#   Azure, GCP, etc.).
 #
-# WHAT IT DOES:
-#   1. Validates that the script is running with root privileges
-#   2. Identifies the root filesystem and verifies it's on LVM
-#   3. Rescans all disk devices (SCSI/SATA and VirtIO) to detect size changes
-#      without requiring a reboot
-#   4. Extends the Physical Volume(s) to use newly available disk space
-#   5. Extends the Logical Volume to consume all free space in the Volume Group
-#   6. Resizes the filesystem (supports ext2/ext3/ext4 and XFS) to fill the
-#      expanded Logical Volume
-#   7. Displays before/after status information for verification
-#
-# REQUIREMENTS:
-#   - Root or sudo privileges
-#   - LVM-based root filesystem
-#   - Standard LVM tools (pvs, vgs, lvs, pvresize, lvextend)
-#   - Filesystem utilities (resize2fs for ext*, xfs_growfs for XFS)
+#   The script performs the complete expansion chain:
+#   1. Rescans physical disks to detect size changes
+#   2. Expands the partition(s) to use all available disk space
+#   3. Extends the Physical Volume(s) to use the full partition
+#   4. Extends the Logical Volume to use all free space in the Volume Group
+#   5. Resizes the filesystem to fill the Logical Volume
 #
 # USAGE:
-#   sudo ./expand_root_fs.sh
+#   sudo bash ./expand-root-lvm.sh
+#
+# REQUIREMENTS:
+#   - Must be run as root or with sudo
+#   - Root filesystem must be on LVM
+#   - Supported filesystems: ext2, ext3, ext4, XFS
+#   - Required packages: lvm2, util-linux
+#   - Recommended packages: cloud-guest-utils (for growpart), parted
+#
+# SUPPORTED DISK TYPES:
+#   - SCSI/SATA disks (sda, sdb, etc.)
+#   - VirtIO disks (vda, vdb, etc.)
+#   - NVMe disks (nvme0n1, nvme1n1, etc.)
 #
 # NOTES:
-#   - Safe to run multiple times (idempotent)
-#   - Works with both traditional (sd*) and VirtIO (vd*) disk devices
-#   - Automatically detects filesystem type and uses appropriate resize tool
-#   - No reboot required
+#   - This script is safe to run even if no expansion is needed
+#   - All operations are performed online (no reboot required)
+#   - The script includes safety checks and informative output
+#   - Compatible with standard Ubuntu LVM installations
+#
+# EXAMPLES:
+#   # After expanding a VM's disk from 20GB to 50GB:
+#   sudo bash ./expand-root-lvm.sh
+#
+#   # The script will automatically:
+#   # - Detect the additional 30GB of space
+#   # - Expand all necessary components
+#   # - Resize the filesystem to use the new space
+#
 ################################################################################
 
 set -e
@@ -52,124 +61,172 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 # Check if running as root
-if [ "$EUID" -ne 0 ]; then 
-    echo -e "${RED}Error: This script must be run as root or with sudo${NC}"
+if [ "$(id -u)" -ne 0 ]; then 
+    printf "${RED}Error: This script must be run as root or with sudo${NC}\n"
     exit 1
 fi
 
-echo -e "${GREEN}=== LVM Root Filesystem Expansion Script ===${NC}\n"
+printf "${GREEN}=== LVM Root Filesystem Expansion Script ===${NC}\n\n"
 
 # Find the root filesystem mount point
 ROOT_MOUNT=$(df / | tail -1 | awk '{print $1}')
-echo -e "Root filesystem device: ${YELLOW}$ROOT_MOUNT${NC}"
+printf "Root filesystem device: ${YELLOW}%s${NC}\n" "$ROOT_MOUNT"
 
 # Check if root is on LVM
-if [[ ! $ROOT_MOUNT =~ /dev/mapper/ ]] && [[ ! $ROOT_MOUNT =~ /dev/.*/.* ]]; then
-    echo -e "${RED}Error: Root filesystem does not appear to be on LVM${NC}"
-    exit 1
-fi
+case "$ROOT_MOUNT" in
+    /dev/mapper/*|/dev/*/*)
+        # Looks like LVM
+        ;;
+    *)
+        printf "${RED}Error: Root filesystem does not appear to be on LVM${NC}\n"
+        exit 1
+        ;;
+esac
 
 # Get LV information
 LV_PATH=$ROOT_MOUNT
-VG_NAME=$(lvs --noheadings -o vg_name $LV_PATH | tr -d ' ')
-LV_NAME=$(lvs --noheadings -o lv_name $LV_PATH | tr -d ' ')
+VG_NAME=$(lvs --noheadings -o vg_name "$LV_PATH" | tr -d ' ')
+LV_NAME=$(lvs --noheadings -o lv_name "$LV_PATH" | tr -d ' ')
 
-echo -e "Volume Group: ${YELLOW}$VG_NAME${NC}"
-echo -e "Logical Volume: ${YELLOW}$LV_NAME${NC}\n"
+printf "Volume Group: ${YELLOW}%s${NC}\n" "$VG_NAME"
+printf "Logical Volume: ${YELLOW}%s${NC}\n\n" "$LV_NAME"
 
 # Find the physical volume(s) for this VG
-PV_DEVICES=$(pvs --noheadings -o pv_name -S vg_name=$VG_NAME | tr -d ' ')
-echo -e "Physical Volume(s): ${YELLOW}$PV_DEVICES${NC}\n"
+PV_DEVICES=$(pvs --noheadings -o pv_name -S vg_name="$VG_NAME" | tr -d ' ')
+printf "Physical Volume(s): ${YELLOW}%s${NC}\n\n" "$PV_DEVICES"
 
 # Rescan all disks for size changes
-echo -e "${GREEN}Step 1: Rescanning disks for size changes...${NC}"
+printf "${GREEN}Step 1: Rescanning disks for size changes...${NC}\n"
 for disk in /sys/class/block/sd*/device/rescan; do
     if [ -f "$disk" ]; then
         echo 1 > "$disk" 2>/dev/null || true
-        disk_name=$(echo $disk | cut -d'/' -f5)
-        echo "  Rescanned: $disk_name"
+        disk_name=$(echo "$disk" | cut -d'/' -f5)
+        printf "  Rescanned: %s\n" "$disk_name"
     fi
 done
 
 for disk in /sys/class/block/vd*/device/rescan; do
     if [ -f "$disk" ]; then
         echo 1 > "$disk" 2>/dev/null || true
-        disk_name=$(echo $disk | cut -d'/' -f5)
-        echo "  Rescanned: $disk_name"
+        disk_name=$(echo "$disk" | cut -d'/' -f5)
+        printf "  Rescanned: %s\n" "$disk_name"
     fi
 done
 
 # Also try partprobe
-if command -v partprobe &> /dev/null; then
-    echo "  Running partprobe..."
+if command -v partprobe >/dev/null 2>&1; then
+    printf "  Running partprobe...\n"
     partprobe 2>/dev/null || true
 fi
 
-echo ""
+printf "\n"
 
 # Show current sizes
-echo -e "${GREEN}Current Status:${NC}"
-pvs | grep $VG_NAME
-echo ""
-vgs $VG_NAME
-echo ""
-lvs $VG_NAME/$LV_NAME
-echo ""
+printf "${GREEN}Current Status:${NC}\n"
+pvs | grep "$VG_NAME"
+printf "\n"
+vgs "$VG_NAME"
+printf "\n"
+lvs "$VG_NAME/$LV_NAME"
+printf "\n"
 
-# Extend each physical volume to use all available space
-echo -e "${GREEN}Step 2: Extending Physical Volume(s)...${NC}"
+# Extend partitions and physical volumes
+printf "${GREEN}Step 2: Extending Partitions and Physical Volumes...${NC}\n"
 for PV in $PV_DEVICES; do
-    echo "  Extending PV: $PV"
-    pvresize $PV
+    printf "  Processing PV: %s\n" "$PV"
+    
+    # Determine if PV is a partition or whole disk
+    # Check if device name ends with a number (indicating a partition)
+    if echo "$PV" | grep -qE '[0-9]$'; then
+        # This is a partition, we need to grow it first
+        
+        # Determine disk type and extract disk/partition number
+        if echo "$PV" | grep -q "nvme"; then
+            # NVMe device (e.g., /dev/nvme0n1p1)
+            DISK=$(echo "$PV" | sed 's/p[0-9]*$//')
+            PART_NUM=$(echo "$PV" | grep -oE '[0-9]+$')
+        else
+            # Standard disk (e.g., /dev/sda1, /dev/vda3)
+            DISK=$(echo "$PV" | sed 's/[0-9]*$//')
+            PART_NUM=$(echo "$PV" | grep -oE '[0-9]+$')
+        fi
+        
+        printf "    Disk: %s, Partition: %s\n" "$DISK" "$PART_NUM"
+        
+        # Try to grow the partition using growpart
+        if command -v growpart >/dev/null 2>&1; then
+            printf "    Growing partition with growpart...\n"
+            if ! growpart "$DISK" "$PART_NUM" 2>/dev/null; then
+                printf "    ${YELLOW}growpart: partition may already be at maximum size${NC}\n"
+            fi
+        else
+            # Fallback to parted if growpart not available
+            printf "    Growing partition with parted (growpart not found)...\n"
+            if ! parted "$DISK" resizepart "$PART_NUM" 100% 2>/dev/null; then
+                printf "    ${YELLOW}parted: partition may already be at maximum size${NC}\n"
+            fi
+        fi
+        
+        # Inform kernel of partition table changes
+        partprobe "$DISK" 2>/dev/null || partx -u "$DISK" 2>/dev/null || true
+        sleep 1
+    fi
+    
+    # Now extend the physical volume
+    printf "    Extending PV to use full partition space...\n"
+    pvresize "$PV"
 done
-echo ""
+printf "\n"
 
 # Show PV status after resize
-echo -e "Physical Volumes after resize:"
-pvs | grep $VG_NAME
-echo ""
+printf "Physical Volumes after resize:\n"
+pvs | grep "$VG_NAME"
+printf "\n"
 
 # Extend the logical volume to use all free space in VG
-echo -e "${GREEN}Step 3: Extending Logical Volume...${NC}"
-FREE_SPACE=$(vgs --noheadings --units g -o vg_free $VG_NAME | tr -d ' ' | sed 's/g//')
-echo "  Available free space: ${FREE_SPACE}G"
+printf "${GREEN}Step 3: Extending Logical Volume...${NC}\n"
+FREE_SPACE=$(vgs --noheadings --units m -o vg_free "$VG_NAME" | tr -d ' ' | sed 's/[^0-9.]//g')
+printf "  Available free space: %sM\n" "$FREE_SPACE"
 
-if (( $(echo "$FREE_SPACE > 0.5" | bc -l) )); then
-    echo "  Extending LV to use all free space..."
-    lvextend -l +100%FREE /dev/$VG_NAME/$LV_NAME
+# Convert to integer for comparison (bash only handles integers)
+FREE_SPACE_INT=$(echo "$FREE_SPACE" | cut -d'.' -f1)
+
+if [ -n "$FREE_SPACE_INT" ] && [ "$FREE_SPACE_INT" -gt 100 ]; then
+    printf "  Extending LV to use all free space...\n"
+    lvextend -l +100%FREE "/dev/$VG_NAME/$LV_NAME"
 else
-    echo -e "${YELLOW}  No significant free space available to extend${NC}"
+    printf "  ${YELLOW}No significant free space available to extend (less than 100M)${NC}\n"
 fi
-echo ""
+printf "\n"
 
 # Show LV status after extension
-echo -e "Logical Volume after extension:"
-lvs $VG_NAME/$LV_NAME
-echo ""
+printf "Logical Volume after extension:\n"
+lvs "$VG_NAME/$LV_NAME"
+printf "\n"
 
 # Resize the filesystem
-echo -e "${GREEN}Step 4: Resizing filesystem...${NC}"
+printf "${GREEN}Step 4: Resizing filesystem...${NC}\n"
 FS_TYPE=$(df -T / | tail -1 | awk '{print $2}')
-echo "  Filesystem type: $FS_TYPE"
+printf "  Filesystem type: %s\n" "$FS_TYPE"
 
 case $FS_TYPE in
     ext[234])
-        echo "  Running resize2fs..."
-        resize2fs $LV_PATH
+        printf "  Running resize2fs...\n"
+        resize2fs "$LV_PATH"
         ;;
     xfs)
-        echo "  Running xfs_growfs..."
+        printf "  Running xfs_growfs...\n"
         xfs_growfs /
         ;;
     *)
-        echo -e "${RED}  Warning: Unsupported filesystem type: $FS_TYPE${NC}"
-        echo "  You may need to resize manually"
+        printf "  ${RED}Warning: Unsupported filesystem type: %s${NC}\n" "$FS_TYPE"
+        printf "  You may need to resize manually\n"
         ;;
 esac
-echo ""
+printf "\n"
 
 # Show final results
-echo -e "${GREEN}=== Final Status ===${NC}"
+printf "${GREEN}=== Final Status ===${NC}\n"
 df -h / | grep -E '(Filesystem|/)'
-echo ""
-echo -e "${GREEN}Filesystem expansion complete!${NC}"
+printf "\n"
+printf "${GREEN}Filesystem expansion complete!${NC}\n"
