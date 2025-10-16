@@ -1,7 +1,47 @@
 #!/bin/bash
 
-# Script to expand LVM root filesystem to maximum available space
-# Handles disk rescanning and extends PV, LV, and filesystem
+################################################################################
+# Copyright (c) 2025 Darren Soothill
+# All rights reserved.
+#
+# This script is provided as-is without any warranty.
+################################################################################
+
+################################################################################
+# LVM Root Filesystem Expansion Script
+#
+# DESCRIPTION:
+#   This script automates the expansion of an LVM-based root filesystem to
+#   utilize all available disk space. It is particularly useful after expanding
+#   a virtual disk in VMware, VirtualBox, cloud platforms (AWS, Azure, GCP),
+#   or other virtualization environments.
+#
+# WHAT IT DOES:
+#   1. Validates that the script is running with root privileges
+#   2. Identifies the root filesystem and verifies it's on LVM
+#   3. Rescans all disk devices (SCSI/SATA and VirtIO) to detect size changes
+#      without requiring a reboot
+#   4. Extends the Physical Volume(s) to use newly available disk space
+#   5. Extends the Logical Volume to consume all free space in the Volume Group
+#   6. Resizes the filesystem (supports ext2/ext3/ext4 and XFS) to fill the
+#      expanded Logical Volume
+#   7. Displays before/after status information for verification
+#
+# REQUIREMENTS:
+#   - Root or sudo privileges
+#   - LVM-based root filesystem
+#   - Standard LVM tools (pvs, vgs, lvs, pvresize, lvextend)
+#   - Filesystem utilities (resize2fs for ext*, xfs_growfs for XFS)
+#
+# USAGE:
+#   sudo ./expand_root_fs.sh
+#
+# NOTES:
+#   - Safe to run multiple times (idempotent)
+#   - Works with both traditional (sd*) and VirtIO (vd*) disk devices
+#   - Automatically detects filesystem type and uses appropriate resize tool
+#   - No reboot required
+################################################################################
 
 set -e
 
