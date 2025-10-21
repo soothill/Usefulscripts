@@ -60,29 +60,73 @@ echo ""
 
 # Upload the key to MikroTik
 echo "Adding SSH key to MikroTik router..."
-echo "You will be prompted for your router password."
+echo "You will be prompted for your router password twice:"
+echo "  1. To upload the key file via SCP"
+echo "  2. To import the key via SSH"
 echo ""
 
-# Method 1: Direct SSH command (works for RouterOS 6.45+)
-ssh "${USERNAME}@${ROUTER_IP}" "/user ssh-keys import public-key-file=stdin user=${USERNAME}" < "$PUBLIC_KEY_FILE"
+# Extract filename from path
+KEY_FILENAME=$(basename "$PUBLIC_KEY_FILE")
+
+# Step 1: Upload the public key file to the router via SCP
+echo "Step 1: Uploading public key file to router..."
+scp "$PUBLIC_KEY_FILE" "${USERNAME}@${ROUTER_IP}:${KEY_FILENAME}"
+
+if [ $? -ne 0 ]; then
+    echo -e "${RED}Failed to upload key file to router.${NC}"
+    echo "Please check:"
+    echo "  - Router IP address is correct: ${ROUTER_IP}"
+    echo "  - Username is correct: ${USERNAME}"
+    echo "  - You have network connectivity to the router"
+    echo "  - SCP/SFTP service is enabled on the router"
+    exit 1
+fi
+
+echo -e "${GREEN}Key file uploaded successfully.${NC}"
+echo ""
+
+# Step 2: Import the uploaded key via SSH
+echo "Step 2: Importing SSH key on router..."
+ssh "${USERNAME}@${ROUTER_IP}" "/user ssh-keys import public-key-file=${KEY_FILENAME} user=${USERNAME}"
 
 if [ $? -eq 0 ]; then
-    echo -e "${GREEN}Success! SSH key added to router.${NC}"
+    echo -e "${GREEN}Success! SSH key imported to router.${NC}"
     echo ""
+
+    # Step 3: Clean up the uploaded file
+    echo "Step 3: Cleaning up temporary file on router..."
+    ssh "${USERNAME}@${ROUTER_IP}" "/file remove ${KEY_FILENAME}" 2>/dev/null
+
+    # Step 4: Disable password authentication for this user
+    echo "Step 4: Disabling password authentication for user ${USERNAME}..."
+    ssh "${USERNAME}@${ROUTER_IP}" "/user set ${USERNAME} password=\"\""
+
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}Password authentication disabled for ${USERNAME}.${NC}"
+        echo -e "${YELLOW}WARNING: This user can now ONLY login via SSH key!${NC}"
+    else
+        echo -e "${YELLOW}Note: Could not disable password authentication.${NC}"
+        echo "To disable it manually, run on the router:"
+        echo "  /user set ${USERNAME} password=\"\""
+    fi
+
+    echo ""
+    echo -e "${GREEN}=== Installation Complete ===${NC}"
     echo "Test your connection with:"
-    echo "ssh ${USERNAME}@${ROUTER_IP}"
+    echo "  ssh ${USERNAME}@${ROUTER_IP}"
+    echo ""
+    echo "IMPORTANT: Password login is now disabled for ${USERNAME}."
+    echo "Make sure your SSH key works before closing this session!"
 else
-    echo -e "${RED}Failed to add key via direct import.${NC}"
-    echo "Trying alternative method..."
+    echo -e "${RED}Failed to import key on router.${NC}"
     echo ""
-    
-    # Method 2: Manual command
-    echo "Run this command manually on your MikroTik router:"
+    echo "Manual steps:"
+    echo "1. Log into your router and run:"
+    echo "   /user ssh-keys import public-key-file=${KEY_FILENAME} user=${USERNAME}"
     echo ""
-    echo "/user ssh-keys import user=${USERNAME} public-key-file=<filename>.pub"
-    echo ""
-    echo "Or add the key directly:"
-    echo "/user ssh-keys add user=${USERNAME} key-data=\"${PUBLIC_KEY}\""
+    echo "2. Then clean up the file:"
+    echo "   /file remove ${KEY_FILENAME}"
+    exit 1
 fi
 
 # Additional info
