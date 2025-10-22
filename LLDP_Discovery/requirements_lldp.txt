@@ -1,0 +1,6 @@
+# Python requirements for LLDP Network Discovery Tool
+
+paramiko>=2.11.0     # SSH client for connecting to switches
+pyyaml>=6.0          # YAML configuration file parsing
+networkx>=2.8        # Graph data structures and algorithms
+matplotlib>=3.5.0    # Visualization and plotting

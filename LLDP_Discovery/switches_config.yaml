@@ -1,0 +1,47 @@
+# LLDP Network Discovery Configuration File
+# Configure your network switches here
+
+# Default credentials (can be overridden per-switch)
+default_username: admin
+default_password: changeme
+
+# List of switches to discover
+switches:
+  # Mikrotik Switches
+  - hostname: 192.168.1.10
+    vendor: mikrotik
+    # Optional: override default credentials
+    # username: admin
+    # password: password
+
+  - hostname: 192.168.1.11
+    vendor: mikrotik
+
+  # Aruba Switches
+  - hostname: 192.168.1.20
+    vendor: aruba
+    username: admin
+    password: aruba123
+
+  - hostname: 192.168.1.21
+    vendor: aruba
+
+  # Arista Switches
+  - hostname: 192.168.1.30
+    vendor: arista
+    username: admin
+    password: arista123
+
+  - hostname: 192.168.1.31
+    vendor: arista
+
+# Optional: Additional settings
+settings:
+  # Connection timeout in seconds
+  timeout: 30
+
+  # Number of retry attempts
+  retry_attempts: 3
+
+  # Delay between device discoveries (seconds)
+  discovery_delay: 1
