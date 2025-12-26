@@ -2,20 +2,21 @@
 #
 # ==============================================================================
 #  openSUSE MicroOS Bootstrap Script
+#  + first-boot oneshot for /home + keys (live filesystem)
+#  + persistent Tailscale ethtool perf tuning (systemd oneshot)
 # ==============================================================================
 #
-#  This script prepares a hardened openSUSE MicroOS host by:
-#
-#   • Installing and enabling Tailscale
-#   • Installing and enabling fail2ban
-#   • Installing and configuring syslog-ng to forward ALL logs to a
-#     central syslog server called "syslog" over TCP/514
-#     - with DISK BUFFERING so logs queue locally if syslog is down
-#   • Locking down SSH to key-based auth only (no passwords)
-#   • Restricting SSH access to group "ssh-users" with only user "darren"
-#   • Pulling SSH keys from https://github.com/soothill.keys
-#
-#  Uses transactional-update (atomic snapshot changes). Reboot required.
+# Snapshot (transactional-update) part:
+#  • Configure Tailscale repo + install tailscale
+#  • Install fail2ban + syslog-ng + ethtool
+#  • Configure syslog-ng forward-all + disk buffer
+#  • SSH hardening (drop-in): keys only, no root, AllowGroups=ssh-users
+#  • Create ssh-users group + ensure user darren exists (home NOT created here)
+#  • Install a first-boot oneshot that runs ON THE LIVE SYSTEM:
+#     - create home, .ssh, authorized_keys from GitHub
+#     - enforce only darren is in ssh-users
+#  • Install a boot oneshot that applies:
+#     ethtool -K <default-route-iface> rx-udp-gro-forwarding on rx-gro-list off
 #
 # ------------------------------------------------------------------------------
 #  Copyright (c) 2025 Darren Soothill
@@ -23,8 +24,6 @@
 #
 #  Contact (obfuscated): darren [at] soothill [dot] com
 # ------------------------------------------------------------------------------
-#
-# ==============================================================================
 
 set -euo pipefail
 
@@ -38,28 +37,22 @@ GITHUB_USER="soothill"
 SYSLOG_HOST="syslog"
 SYSLOG_PORT="514"
 
-# Syslog-ng disk buffering
-# Where to spool logs if the remote syslog target is unavailable.
-# Note: on MicroOS this persists (writable /var).
 SYSLOG_BUFFER_DIR="/var/lib/syslog-ng"
 SYSLOG_BUFFER_FILE="${SYSLOG_BUFFER_DIR}/syslog-buffer.qf"
-
-# Max size of disk-buffer (tune to taste)
 SYSLOG_DISKBUF_SIZE="512M"
-
-# How long to keep messages in buffer if remote stays unavailable (optional)
-# 0 means keep until delivered (subject to diskbuf size)
 SYSLOG_DISKBUF_RELIABLE="yes"
 
 AUTO_REBOOT="${AUTO_REBOOT:-1}"
-TS_AUTHKEY="${TS_AUTHKEY:-}"  # optional
+TS_AUTHKEY="${TS_AUTHKEY:-}"   # optional
 
 log() { echo "==> $*"; }
 
 if [[ "${EUID}" -ne 0 ]]; then
-  echo "ERROR: Run as root (or sudo)."
+  echo "ERROR: Run as root (or via sudo)."
   exit 1
 fi
+
+export TS_AUTHKEY
 
 log "Staging configuration into a new MicroOS snapshot..."
 
@@ -80,56 +73,87 @@ SYSLOG_DISKBUF_RELIABLE="yes"
 
 TS_AUTHKEY="${TS_AUTHKEY:-}"
 
-echo "==> Adding Tailscale repository..."
-zypper -n ar -f https://pkgs.tailscale.com/stable/opensuse/tumbleweed tailscale || true
-zypper -n --gpg-auto-import-keys refresh
-
-echo "==> Installing packages..."
-zypper -n install tailscale syslog-ng fail2ban openssh curl ca-certificates
-
-echo "==> Ensure user + SSH group exist..."
-getent group "${SSH_GROUP}" >/dev/null 2>&1 || groupadd "${SSH_GROUP}"
-
-if ! id -u "${USER_NAME}" >/dev/null 2>&1; then
-  useradd -m -s /bin/bash "${USER_NAME}"
+# --------------------------------------------------------------------------
+# Tailscale repo (idempotent): remove any pkgs.tailscale.com repos, then add
+# --------------------------------------------------------------------------
+echo "==> Ensuring correct Tailscale repository is configured..."
+existing_repo_aliases="$(zypper lr -u | awk '/pkgs\.tailscale\.com/ {print $1}')"
+if [[ -n "${existing_repo_aliases}" ]]; then
+  echo "==> Removing existing Tailscale repo(s): ${existing_repo_aliases}"
+  for repo in ${existing_repo_aliases}; do
+    zypper -n rr "${repo}"
+  done
 fi
 
-# Ensure only USER_NAME is in SSH_GROUP
-usermod -aG "${SSH_GROUP}" "${USER_NAME}"
-gpasswd -M "${USER_NAME}" "${SSH_GROUP}"
+echo "==> Adding correct Tailscale repo (.repo file)..."
+zypper -n ar -g -r https://pkgs.tailscale.com/stable/opensuse/tumbleweed/tailscale.repo
+zypper -n --gpg-auto-import-keys refresh
 
-echo "==> Pulling GitHub public keys into authorized_keys..."
-home_dir="$(getent passwd "${USER_NAME}" | cut -d: -f6)"
-install -d -m 0700 -o "${USER_NAME}" -g "${USER_NAME}" "${home_dir}/.ssh"
-curl -fsSL "https://github.com/${GITHUB_USER}.keys" -o "${home_dir}/.ssh/authorized_keys"
-chown "${USER_NAME}:${USER_NAME}" "${home_dir}/.ssh/authorized_keys"
-chmod 0600 "${home_dir}/.ssh/authorized_keys"
+# --------------------------------------------------------------------------
+# Install packages
+# --------------------------------------------------------------------------
+echo "==> Installing packages..."
+zypper -n install \
+  tailscale \
+  syslog-ng \
+  fail2ban \
+  openssh \
+  curl \
+  ca-certificates \
+  ethtool
 
-echo "==> Locking down SSH (keys only, group restriction)..."
-sshd_cfg="/etc/ssh/sshd_config"
-cp "${sshd_cfg}" "${sshd_cfg}.bak.$(date +%Y%m%d%H%M%S)"
+# --------------------------------------------------------------------------
+# Create SSH access group and user (do NOT create /home in snapshot)
+# Home + keys will be done by a first-boot oneshot on the real running system.
+# --------------------------------------------------------------------------
+echo "==> Ensuring SSH access group exists..."
+getent group "${SSH_GROUP}" >/dev/null 2>&1 || groupadd "${SSH_GROUP}"
 
-set_sshd() {
-  local key="$1" val="$2"
-  if grep -qE "^[#[:space:]]*${key}[[:space:]]+" "${sshd_cfg}"; then
-    sed -i -E "s|^[#[:space:]]*${key}[[:space:]]+.*|${key} ${val}|g" "${sshd_cfg}"
-  else
-    echo "${key} ${val}" >> "${sshd_cfg}"
+echo "==> Ensuring user exists (without creating /home in snapshot)..."
+if ! id -u "${USER_NAME}" >/dev/null 2>&1; then
+  useradd -M -s /bin/bash "${USER_NAME}"
+fi
+
+usermod -aG "${SSH_GROUP}" "${USER_NAME}" || true
+
+# --------------------------------------------------------------------------
+# SSH hardening via drop-in
+# --------------------------------------------------------------------------
+echo "==> Hardening SSH configuration via /etc/ssh/sshd_config.d ..."
+mkdir -p /etc/ssh/sshd_config.d
+
+cat >/etc/ssh/sshd_config.d/99-hardening.conf <<CONF
+# Managed by MicroOS bootstrap script
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+PubkeyAuthentication yes
+
+PermitRootLogin no
+AllowGroups ${SSH_GROUP}
+
+AuthorizedKeysFile .ssh/authorized_keys
+
+MaxAuthTries 3
+LoginGraceTime 20
+CONF
+chmod 0644 /etc/ssh/sshd_config.d/99-hardening.conf
+
+# Seed /etc/ssh/sshd_config if missing (some images keep canonical config in /usr/etc)
+if [[ ! -f /etc/ssh/sshd_config ]]; then
+  if [[ -f /usr/etc/ssh/sshd_config ]]; then
+    mkdir -p /etc/ssh
+    cp /usr/etc/ssh/sshd_config /etc/ssh/sshd_config
+  elif [[ -f /etc/ssh/sshd_config.default ]]; then
+    mkdir -p /etc/ssh
+    cp /etc/ssh/sshd_config.default /etc/ssh/sshd_config
   fi
-}
+fi
 
-set_sshd "PasswordAuthentication" "no"
-set_sshd "KbdInteractiveAuthentication" "no"
-set_sshd "ChallengeResponseAuthentication" "no"
-set_sshd "PubkeyAuthentication" "yes"
-set_sshd "PermitRootLogin" "no"
-set_sshd "UsePAM" "yes"
-set_sshd "AllowGroups" "${SSH_GROUP}"
-set_sshd "AuthorizedKeysFile" ".ssh/authorized_keys"
-set_sshd "MaxAuthTries" "3"
-set_sshd "LoginGraceTime" "20"
-
-echo "==> Configuring fail2ban (enable sshd jail)..."
+# --------------------------------------------------------------------------
+# fail2ban configuration
+# --------------------------------------------------------------------------
+echo "==> Configuring fail2ban for SSH..."
 install -d /etc/fail2ban/jail.d
 cat >/etc/fail2ban/jail.d/sshd.local <<'JAIL'
 [sshd]
@@ -140,60 +164,159 @@ findtime = 10m
 maxretry = 5
 JAIL
 
-echo "==> Configuring syslog-ng to forward everything to '${SYSLOG_HOST}' with disk buffering..."
+# --------------------------------------------------------------------------
+# syslog-ng forwarding + disk buffering
+# --------------------------------------------------------------------------
+echo "==> Configuring syslog-ng forwarding with disk buffering..."
 install -d /etc/syslog-ng/conf.d
 install -d -m 0755 "${SYSLOG_BUFFER_DIR}"
 
 cat >/etc/syslog-ng/conf.d/99-forward-all.conf <<CONF
-# -----------------------------------------------------------------------------
-# Forward ALL logs to central syslog host over TCP/${SYSLOG_PORT}
-# with local disk buffering to survive outages.
-#
-# Disk buffer notes:
-#  - reliable(${SYSLOG_DISKBUF_RELIABLE}) keeps messages on disk until delivered
-#  - disk-buf-size(${SYSLOG_DISKBUF_SIZE}) caps spool usage
-#  - qfile() path persists in /var (writable on MicroOS)
-# -----------------------------------------------------------------------------
-
 destination d_remote_tcp {
   syslog("${SYSLOG_HOST}"
     transport("tcp")
     port(${SYSLOG_PORT})
     flags(syslog-protocol)
     time-reopen(10)
-
-    # Disk buffering (spool to disk when destination is unavailable)
     disk-buffer(
       reliable(${SYSLOG_DISKBUF_RELIABLE})
       disk-buf-size(${SYSLOG_DISKBUF_SIZE})
-      qout-size(1000)
-      mem-buf-length(10000)
       qfile("${SYSLOG_BUFFER_FILE}")
     )
   );
 };
 
-# On openSUSE the default source is typically "src"
 log { source(src); destination(d_remote_tcp); };
 CONF
 
-echo "==> Enabling services on boot..."
-systemctl enable sshd
-systemctl enable tailscaled
-systemctl enable syslog-ng
-systemctl enable fail2ban
+# --------------------------------------------------------------------------
+# First-boot oneshot: create home + keys ON LIVE SYSTEM (after reboot)
+# --------------------------------------------------------------------------
+echo "==> Installing first-boot oneshot to create home + authorized_keys on live system..."
+install -d /usr/local/sbin
 
-echo "==> Optional: auto-enroll Tailscale if TS_AUTHKEY is provided..."
+cat >/usr/local/sbin/microos-firstboot-homekeys.sh <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+
+USER_NAME="darren"
+SSH_GROUP="ssh-users"
+GITHUB_USER="soothill"
+
+USER_HOME="$(getent passwd "${USER_NAME}" | awk -F: '{print $6}')"
+if [[ -z "${USER_HOME}" ]]; then
+  echo "ERROR: Could not determine home directory for ${USER_NAME} from passwd."
+  exit 1
+fi
+
+getent group "${SSH_GROUP}" >/dev/null 2>&1 || groupadd "${SSH_GROUP}"
+id -u "${USER_NAME}" >/dev/null 2>&1 || useradd -M -s /bin/bash "${USER_NAME}"
+
+mkdir -p "${USER_HOME}"
+chown "${USER_NAME}:${USER_NAME}" "${USER_HOME}"
+chmod 0750 "${USER_HOME}"
+
+usermod -aG "${SSH_GROUP}" "${USER_NAME}" || true
+gpasswd -M "${USER_NAME}" "${SSH_GROUP}"
+
+install -d -m 0700 -o "${USER_NAME}" -g "${USER_NAME}" "${USER_HOME}/.ssh"
+curl -fsSL "https://github.com/${GITHUB_USER}.keys" -o "${USER_HOME}/.ssh/authorized_keys"
+chown "${USER_NAME}:${USER_NAME}" "${USER_HOME}/.ssh/authorized_keys"
+chmod 0600 "${USER_HOME}/.ssh/authorized_keys"
+
+systemctl try-restart sshd >/dev/null 2>&1 || true
+SCRIPT
+
+chmod 0755 /usr/local/sbin/microos-firstboot-homekeys.sh
+
+cat >/etc/systemd/system/microos-firstboot-homekeys.service <<'UNIT'
+[Unit]
+Description=MicroOS first boot: create home directory and install GitHub authorized_keys
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/microos-firstboot-homekeys.sh
+ExecStartPost=/usr/bin/systemctl disable microos-firstboot-homekeys.service
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl enable microos-firstboot-homekeys.service
+
+# --------------------------------------------------------------------------
+# Tailscale performance tuning (persistent)
+# Per Tailscale KB: enable rx-udp-gro-forwarding and disable rx-gro-list
+# on the interface that carries internet/default-route traffic.
+# --------------------------------------------------------------------------
+echo "==> Installing Tailscale ethtool performance tuning oneshot..."
+cat >/usr/local/sbin/tailscale-ethtool-tune.sh <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Determine default route interface (same idea as Tailscale KB example)
+NETDEV="$(ip -o route get 8.8.8.8 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
+
+if [[ -z "${NETDEV}" ]]; then
+  echo "tailscale-ethtool: could not determine default-route interface; skipping."
+  exit 0
+fi
+
+if ! command -v ethtool >/dev/null 2>&1; then
+  echo "tailscale-ethtool: ethtool not installed; skipping."
+  exit 0
+fi
+
+# Only attempt if the NIC advertises these features; otherwise skip quietly.
+if ethtool -k "${NETDEV}" 2>/dev/null | grep -qE 'rx-udp-gro-forwarding:'; then
+  ethtool -K "${NETDEV}" rx-udp-gro-forwarding on rx-gro-list off || true
+  echo "tailscale-ethtool: applied tuning on ${NETDEV}"
+else
+  echo "tailscale-ethtool: ${NETDEV} does not support rx-udp-gro-forwarding; skipping."
+fi
+
+exit 0
+SCRIPT
+
+chmod 0755 /usr/local/sbin/tailscale-ethtool-tune.sh
+
+cat >/etc/systemd/system/tailscale-ethtool.service <<'UNIT'
+[Unit]
+Description=Tailscale performance tuning (ethtool GRO settings)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/tailscale-ethtool-tune.sh
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl enable tailscale-ethtool.service
+
+# --------------------------------------------------------------------------
+# Enable services
+# --------------------------------------------------------------------------
+echo "==> Enabling services..."
+systemctl enable sshd tailscaled syslog-ng fail2ban
+
+# Optional: unattended Tailscale enrollment
 if [[ -n "${TS_AUTHKEY:-}" ]]; then
+  echo "==> Attempting unattended Tailscale enrollment..."
   tailscale up --authkey="${TS_AUTHKEY}" --accept-dns=false || true
 fi
 
-echo "==> Done staging changes into snapshot."
+echo "==> Snapshot configuration complete."
 EOF
 
 if [[ "${AUTO_REBOOT}" == "1" ]]; then
-  log "Rebooting to activate the new snapshot..."
+  log "Rebooting to activate new snapshot..."
   transactional-update reboot
 else
-  log "Snapshot prepared. Reboot when ready: sudo transactional-update reboot"
+  log "Snapshot ready. Reboot manually when convenient: sudo transactional-update reboot"
 fi
