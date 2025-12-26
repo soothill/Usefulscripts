@@ -2,21 +2,20 @@
 #
 # ==============================================================================
 #  openSUSE MicroOS Bootstrap Script
-#  + first-boot oneshot for /home + keys (live filesystem)
-#  + persistent Tailscale ethtool perf tuning (systemd oneshot)
+#  - transactional-update snapshot for packages + /etc config
+#  - first-boot oneshot for /home + authorized_keys (runs on LIVE system)
+#  - persistent Tailscale ethtool perf tuning (runs on every boot)
 # ==============================================================================
 #
-# Snapshot (transactional-update) part:
-#  • Configure Tailscale repo + install tailscale
-#  • Install fail2ban + syslog-ng + ethtool
-#  • Configure syslog-ng forward-all + disk buffer
-#  • SSH hardening (drop-in): keys only, no root, AllowGroups=ssh-users
-#  • Create ssh-users group + ensure user darren exists (home NOT created here)
-#  • Install a first-boot oneshot that runs ON THE LIVE SYSTEM:
-#     - create home, .ssh, authorized_keys from GitHub
-#     - enforce only darren is in ssh-users
-#  • Install a boot oneshot that applies:
-#     ethtool -K <default-route-iface> rx-udp-gro-forwarding on rx-gro-list off
+# Snapshot part (transactional-update):
+#  • Add/refresh Tailscale repo (idempotent)
+#  • Install: tailscale, fail2ban, syslog-ng, ethtool, openssh, curl
+#  • Configure syslog-ng: forward all -> host "syslog" TCP/514 + disk buffering
+#  • Harden SSH using drop-in: keys only, no root, AllowGroups=ssh-users
+#  • Ensure ssh-users group exists; ensure user darren exists (NO home creation here)
+#  • Install systemd oneshots:
+#      - microos-firstboot-homekeys.service (runs once after reboot on LIVE FS)
+#      - tailscale-ethtool.service (runs every boot, uses /etc/tailscale script)
 #
 # ------------------------------------------------------------------------------
 #  Copyright (c) 2025 Darren Soothill
@@ -103,21 +102,20 @@ zypper -n install \
   ethtool
 
 # --------------------------------------------------------------------------
-# Create SSH access group and user (do NOT create /home in snapshot)
-# Home + keys will be done by a first-boot oneshot on the real running system.
+# Ensure SSH access group and user exist (DO NOT create /home in snapshot)
 # --------------------------------------------------------------------------
 echo "==> Ensuring SSH access group exists..."
 getent group "${SSH_GROUP}" >/dev/null 2>&1 || groupadd "${SSH_GROUP}"
 
 echo "==> Ensuring user exists (without creating /home in snapshot)..."
 if ! id -u "${USER_NAME}" >/dev/null 2>&1; then
+  # Create user entry; home will be created on live FS by oneshot
   useradd -M -s /bin/bash "${USER_NAME}"
 fi
-
 usermod -aG "${SSH_GROUP}" "${USER_NAME}" || true
 
 # --------------------------------------------------------------------------
-# SSH hardening via drop-in
+# SSH hardening via drop-in (avoids assuming /etc/ssh/sshd_config exists)
 # --------------------------------------------------------------------------
 echo "==> Hardening SSH configuration via /etc/ssh/sshd_config.d ..."
 mkdir -p /etc/ssh/sshd_config.d
@@ -193,9 +191,9 @@ CONF
 # First-boot oneshot: create home + keys ON LIVE SYSTEM (after reboot)
 # --------------------------------------------------------------------------
 echo "==> Installing first-boot oneshot to create home + authorized_keys on live system..."
-install -d /usr/local/sbin
+install -d /etc/microos-bootstrap
 
-cat >/usr/local/sbin/microos-firstboot-homekeys.sh <<'SCRIPT'
+cat >/etc/microos-bootstrap/firstboot-homekeys.sh <<'SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -203,6 +201,7 @@ USER_NAME="darren"
 SSH_GROUP="ssh-users"
 GITHUB_USER="soothill"
 
+# Source of truth for sshd chdir:
 USER_HOME="$(getent passwd "${USER_NAME}" | awk -F: '{print $6}')"
 if [[ -z "${USER_HOME}" ]]; then
   echo "ERROR: Could not determine home directory for ${USER_NAME} from passwd."
@@ -212,13 +211,16 @@ fi
 getent group "${SSH_GROUP}" >/dev/null 2>&1 || groupadd "${SSH_GROUP}"
 id -u "${USER_NAME}" >/dev/null 2>&1 || useradd -M -s /bin/bash "${USER_NAME}"
 
+# Create home on LIVE filesystem (important when /home is a separate mount)
 mkdir -p "${USER_HOME}"
 chown "${USER_NAME}:${USER_NAME}" "${USER_HOME}"
 chmod 0750 "${USER_HOME}"
 
+# Enforce ONLY darren in ssh-users
 usermod -aG "${SSH_GROUP}" "${USER_NAME}" || true
 gpasswd -M "${USER_NAME}" "${SSH_GROUP}"
 
+# Install keys
 install -d -m 0700 -o "${USER_NAME}" -g "${USER_NAME}" "${USER_HOME}/.ssh"
 curl -fsSL "https://github.com/${GITHUB_USER}.keys" -o "${USER_HOME}/.ssh/authorized_keys"
 chown "${USER_NAME}:${USER_NAME}" "${USER_HOME}/.ssh/authorized_keys"
@@ -227,7 +229,7 @@ chmod 0600 "${USER_HOME}/.ssh/authorized_keys"
 systemctl try-restart sshd >/dev/null 2>&1 || true
 SCRIPT
 
-chmod 0755 /usr/local/sbin/microos-firstboot-homekeys.sh
+chmod 0755 /etc/microos-bootstrap/firstboot-homekeys.sh
 
 cat >/etc/systemd/system/microos-firstboot-homekeys.service <<'UNIT'
 [Unit]
@@ -237,7 +239,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/microos-firstboot-homekeys.sh
+ExecStart=/etc/microos-bootstrap/firstboot-homekeys.sh
 ExecStartPost=/usr/bin/systemctl disable microos-firstboot-homekeys.service
 RemainAfterExit=no
 
@@ -248,16 +250,17 @@ UNIT
 systemctl enable microos-firstboot-homekeys.service
 
 # --------------------------------------------------------------------------
-# Tailscale performance tuning (persistent)
-# Per Tailscale KB: enable rx-udp-gro-forwarding and disable rx-gro-list
-# on the interface that carries internet/default-route traffic.
+# Tailscale performance tuning (persistent) using /etc/tailscale/ script
+# Fixes 203/EXEC issues seen with /usr/local on some MicroOS layouts.
 # --------------------------------------------------------------------------
-echo "==> Installing Tailscale ethtool performance tuning oneshot..."
-cat >/usr/local/sbin/tailscale-ethtool-tune.sh <<'SCRIPT'
+echo "==> Installing Tailscale ethtool performance tuning (persistent)..."
+install -d /etc/tailscale
+
+cat >/etc/tailscale/tailscale-ethtool-tune.sh <<'SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Determine default route interface (same idea as Tailscale KB example)
+# Determine default route interface (matches Tailscale KB best practice intent)
 NETDEV="$(ip -o route get 8.8.8.8 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
 
 if [[ -z "${NETDEV}" ]]; then
@@ -270,7 +273,7 @@ if ! command -v ethtool >/dev/null 2>&1; then
   exit 0
 fi
 
-# Only attempt if the NIC advertises these features; otherwise skip quietly.
+# Apply only if supported by NIC driver
 if ethtool -k "${NETDEV}" 2>/dev/null | grep -qE 'rx-udp-gro-forwarding:'; then
   ethtool -K "${NETDEV}" rx-udp-gro-forwarding on rx-gro-list off || true
   echo "tailscale-ethtool: applied tuning on ${NETDEV}"
@@ -281,7 +284,7 @@ fi
 exit 0
 SCRIPT
 
-chmod 0755 /usr/local/sbin/tailscale-ethtool-tune.sh
+chmod 0755 /etc/tailscale/tailscale-ethtool-tune.sh
 
 cat >/etc/systemd/system/tailscale-ethtool.service <<'UNIT'
 [Unit]
@@ -291,7 +294,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/tailscale-ethtool-tune.sh
+ExecStart=/bin/bash /etc/tailscale/tailscale-ethtool-tune.sh
 
 [Install]
 WantedBy=multi-user.target
